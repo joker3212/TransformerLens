@@ -6,9 +6,11 @@ from .past_key_value_caching import (
     HookedTransformerKeyValueCacheEntry,
 )
 from . import components
+from .HookedSSMConfig import HookedSSMConfig
 from .HookedTransformerConfig import HookedTransformerConfig
 from .FactoredMatrix import FactoredMatrix
 from .ActivationCache import ActivationCache
+from .HookedSSM import HookedSSM
 from .HookedTransformer import HookedTransformer
 from .SVDInterpreter import SVDInterpreter
 from .HookedEncoder import HookedEncoder

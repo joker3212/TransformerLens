@@ -37,11 +37,24 @@ class HookedSSMConfig:
         seed (int, *optional*): The seed to use for the model.
             Used to set sources of randomness (Python, PyTorch and
             NumPy) and to initialize weights. Defaults to None. We recommend setting a seed, so your experiments are reproducible.
+        # TODO add docs for all the Mamba specifc params
     """
     d_model: int
     n_layers: int
     vocab_size: int
     d_vocab: int
+    d_state: int = 16
+    d_conv: int = 4
+    expand: int = 2
+    dt_rank: str = "auto"
+    dt_min: float = 0.001
+    dt_max: float = 0.1
+    dt_init: str = "random"
+    dt_scale: float = 1.0
+    dt_init_floor: float = 1e-4
+    conv_bias: bool = True
+    bias: bool = False
+    use_fast_path: bool = True
     pad_vocab_size_multiple: int = 1
     device: Optional[str]
     seed: Optional[int]
