@@ -15,11 +15,12 @@
     [tool.poetry.dependencies]
         accelerate=">=0.23.0" # Needed for Llama Models
         beartype="^0.14.1"
-        causal-conv1d="<=1.0.2" # Needed for Mamba Models 
+        causal-conv1d="<=1.0.2"
         datasets=">=2.7.1"
         einops=">=0.6.0"
         fancy-einsum=">=0.0.3"
         jaxtyping=">=0.2.11"
+        mamba-ssm=">=1.0.1"
         numpy=[
             {version=">=1.20,<1.25", python=">=3.8,<3.9"},
             {version=">=1.24", python=">=3.9,<3.12"},
