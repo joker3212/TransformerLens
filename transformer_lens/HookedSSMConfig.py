@@ -22,11 +22,35 @@ SUPPORTED_ACTIVATIONS = ["relu", "gelu", "silu", "gelu_new", "solu_ln", "gelu_fa
 @dataclass
 class HookedSSMConfig:
     """
-    """
-    
+    Configuration class to store the configuration of a HookedSSM model.
 
+    See further_comments.md for more details on the more complex arguments.
+    
+    Args:
+        d_model (int): The dimensionality of the embeddings
+        n_layers (int): The number of mamba blocks
+        d_vocab (int): The size of the vocabulary. Defaults to -1, which means not set. If not set, will be
+            automatically set from the tokenizer's vocab size.
+        pad_vocab_size_multiple (int): # TODO add documentation
+        device(str): The device to use for the model. Defaults to 'cuda' if
+            available, else 'cpu'. Must be 'cuda' if `n_devices` > 1.
+        seed (int, *optional*): The seed to use for the model.
+            Used to set sources of randomness (Python, PyTorch and
+            NumPy) and to initialize weights. Defaults to None. We recommend setting a seed, so your experiments are reproducible.
+    """
+    d_model: int
+    n_layers: int
+    vocab_size: int
+    d_vocab: int
+    pad_vocab_size_multiple: int = 1
+    device: Optional[str]
+    seed: Optional[int]
+    
     def __post_init__(self):
-        pass
+        if self.seed is not None:
+            self.set_seed_everywhere(self.seed)
+        if self.device is None:
+            self.device = utils.get_device()
 
     @classmethod
     def from_dict(cls, config_dict: Dict[str, Any]) -> HookedSSMConfig:
