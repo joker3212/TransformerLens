@@ -15,6 +15,7 @@
     [tool.poetry.dependencies]
         accelerate=">=0.23.0" # Needed for Llama Models
         beartype="^0.14.1"
+        causal-conv1d="<=1.0.2" # Needed for Mamba Models 
         datasets=">=2.7.1"
         einops=">=0.6.0"
         fancy-einsum=">=0.0.3"
