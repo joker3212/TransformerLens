@@ -32,7 +32,7 @@ from transformer_lens.components import (
     PosEmbed,
     RMSNorm,
     RMSNormPre,
-    TransformerBlock,
+    MambaBlock,
     Unembed,
 )
 from transformer_lens.FactoredMatrix import FactoredMatrix
@@ -136,12 +136,12 @@ class HookedSSM(HookedRootModule):
 
         self.blocks = nn.ModuleList(
             [
-                TransformerBlock(self.cfg, block_index)
+                MambaBlock(self.cfg, block_index)
                 for block_index in range(self.cfg.n_layers)
             ]
         )
 
-        #self.unembed = Unembed(self.cfg)
+        self.unembed = Unembed(self.cfg)
 
         if self.cfg.init_weights:
             self.init_weights()
@@ -305,90 +305,6 @@ class HookedSSM(HookedRootModule):
                 f"Invalid positional_embedding_type passed in {self.cfg.positional_embedding_type}"
             )
         return residual, tokens, shortformer_pos_embed, attention_mask
-
-    @overload
-    def forward(
-        self,
-        input,
-        return_type: Literal["logits"],
-        loss_per_token: Optional[bool] = False,
-        prepend_bos: Optional[Union[bool, None]] = USE_DEFAULT_VALUE,
-        padding_side: Optional[
-            Union[Literal["left", "right"], None]
-        ] = USE_DEFAULT_VALUE,
-        start_at_layer: Optional[int] = None,
-        tokens: Optional[Int[torch.Tensor, "batch pos"]] = None,
-        shortformer_pos_embed: Optional[
-            Float[torch.Tensor, "batch pos d_model"]
-        ] = None,
-        attention_mask: Optional[torch.Tensor] = None,  # [batch pos]
-        stop_at_layer: Optional[int] = None,
-        past_kv_cache: Optional[HookedTransformerKeyValueCache] = None,
-    ) -> Loss:
-        ...
-
-    @overload
-    def forward(
-        self,
-        input,
-        return_type: Literal["loss"],
-        loss_per_token: Optional[bool] = False,
-        prepend_bos: Optional[Union[bool, None]] = USE_DEFAULT_VALUE,
-        padding_side: Optional[
-            Union[Literal["left", "right"], None]
-        ] = USE_DEFAULT_VALUE,
-        start_at_layer: Optional[int] = None,
-        tokens: Optional[Int[torch.Tensor, "batch pos"]] = None,
-        shortformer_pos_embed: Optional[
-            Float[torch.Tensor, "batch pos d_model"]
-        ] = None,
-        attention_mask: Optional[torch.Tensor] = None,  # [batch pos]
-        stop_at_layer: Optional[int] = None,
-        past_kv_cache: Optional[HookedTransformerKeyValueCache] = None,
-    ) -> Loss:
-        ...
-
-    @overload
-    def forward(
-        self,
-        input,
-        return_type: Literal["both"],
-        loss_per_token: Optional[bool] = False,
-        prepend_bos: Optional[Union[bool, None]] = USE_DEFAULT_VALUE,
-        padding_side: Optional[
-            Union[Literal["left", "right"], None]
-        ] = USE_DEFAULT_VALUE,
-        start_at_layer: Optional[int] = None,
-        tokens: Optional[Int[torch.Tensor, "batch pos"]] = None,
-        shortformer_pos_embed: Optional[
-            Float[torch.Tensor, "batch pos d_model"]
-        ] = None,
-        attention_mask: Optional[torch.Tensor] = None,  # [batch pos]
-        stop_at_layer: Optional[int] = None,
-        past_kv_cache: Optional[HookedTransformerKeyValueCache] = None,
-    ) -> Tuple[Float[torch.Tensor, "batch pos d_vocab"], Loss]:
-        ...
-
-    @overload
-    def forward(
-        self,
-        input,
-        return_type: Literal[None],
-        loss_per_token: Optional[bool] = False,
-        prepend_bos: Optional[Union[bool, None]] = USE_DEFAULT_VALUE,
-        padding_side: Optional[
-            Union[Literal["left", "right"], None]
-        ] = USE_DEFAULT_VALUE,
-        start_at_layer: Optional[int] = None,
-        tokens: Optional[Int[torch.Tensor, "batch pos"]] = None,
-        shortformer_pos_embed: Optional[
-            Float[torch.Tensor, "batch pos d_model"]
-        ] = None,
-        attention_mask: Optional[torch.Tensor] = None,  # [batch pos]
-        stop_at_layer: Optional[int] = None,
-        past_kv_cache: Optional[HookedTransformerKeyValueCache] = None,
-    ) -> None:
-        ...
 
     def forward(
         self,
@@ -564,18 +480,7 @@ class HookedSSM(HookedRootModule):
             tokens = tokens.to(logits.device)
         return utils.lm_cross_entropy_loss(logits, tokens, per_token)
 
-    @overload
-    def run_with_cache(
-        self, *model_args, return_cache_object: Literal[True] = True, **kwargs
-    ) -> Tuple[Output, ActivationCache]:
-        ...
-
-    @overload
-    def run_with_cache(
-        self, *model_args, return_cache_object: Literal[False] = False, **kwargs
-    ) -> Tuple[Output, Dict[str, torch.Tensor]]:
-        ...
-
+    
     def run_with_cache(
         self, *model_args, return_cache_object=True, remove_batch_dim=False, **kwargs
     ) -> Tuple[
@@ -1596,181 +1501,6 @@ class HookedSSM(HookedRootModule):
         )
         return state_dict
 
-    def fold_value_biases(self, state_dict: Dict[str, torch.Tensor]):
-        """Fold the value biases into the output bias.
-
-        Because attention patterns add up to 1, the value biases always have a constant effect on a
-        head's output. Further, as the outputs of each head in a layer add together, each head's
-        value bias has a constant effect on the *layer's* output, which can make it harder to
-        interpret the effect of any given head, and it doesn't matter which head a bias is
-        associated with. We can factor this all into a single output bias to the layer, and make it
-        easier to interpret the head's output. Formally, we take b_O_new = b_O_original +
-        sum_head(b_V_head @ W_O_head).
-        """
-        for layer in range(self.cfg.n_layers):
-            # shape [head_index, d_head]
-            b_V = state_dict[f"blocks.{layer}.attn.b_V"]
-            # [head_index, d_head, d_model]
-            W_O = state_dict[f"blocks.{layer}.attn.W_O"]
-            # [d_model]
-            b_O_original = state_dict[f"blocks.{layer}.attn.b_O"]
-
-            folded_b_O = b_O_original + (b_V[:, :, None] * W_O).sum([0, 1])
-
-            state_dict[f"blocks.{layer}.attn.b_O"] = folded_b_O
-            state_dict[f"blocks.{layer}.attn.b_V"] = torch.zeros_like(b_V)
-        return state_dict
-
-    def refactor_factored_attn_matrices(self, state_dict: Dict[str, torch.Tensor]):
-        """Experimental method for managing queries, keys and values.
-
-        As argued in [A Mathematical Framework for Transformer
-        Circuits](https://transformer-circuits.pub/2021/framework/index.html), queries, keys and
-        values are somewhat arbitrary intermediate terms when computing with the low rank factored
-        matrices W_QK = W_Q @ W_K.T and W_OV = W_V @ W_O, and these matrices are the only thing
-        determining head behaviour. But there are many ways to find a low rank factorization to a
-        given matrix, and hopefully some of these are more interpretable than others! This method is
-        one attempt, which makes all of the matrices have orthogonal rows or columns, W_O into a
-        rotation and W_Q and W_K having the nth column in each having the same norm. The formula is
-        $W_V = U @ S,W_O=Vh.T,W_Q=U@S.sqrt(),W_K=Vh@S.sqrt()$.
-
-        More details:
-
-        If W_OV = U @ S @ Vh.T in its singular value decomposition, (where S is in R^d_head not
-        R^d_model, as W_OV is low rank), W_OV = (U @ S) @ (Vh.T) is an equivalent low rank
-        factorisation, where rows/columns of each matrix are orthogonal! So setting $W_V=US$ and
-        $W_O=Vh.T$ works just as well. I *think* this is a more interpretable setup, because now
-        $W_O$ is just a rotation, and doesn't change the norm, so $z$ has the same norm as the
-        result of the head.
-
-        For $W_QK = W_Q @ W_K.T$ we use the refactor $W_Q = U @ S.sqrt()$ and $W_K = Vh @ S.sqrt()$,
-        which is also equivalent ($S==S.sqrt() @ S.sqrt()$ as $S$ is diagonal). Here we keep the
-        matrices as having the same norm, since there's not an obvious asymmetry between the keys
-        and queries.
-
-        Biases are more fiddly to deal with. For OV it's pretty easy - we just need (x @ W_V + b_V)
-        @ W_O + b_O to be preserved, so we can set b_V' = 0. and b_O' = b_V @ W_O + b_O (note that
-        b_V in R^{head_index x d_head} while b_O in R^{d_model}, so we need to sum b_V @ W_O along
-        the head_index dimension too).
-
-        For QK it's messy - we need to preserve the bilinear form of (x @ W_Q + b_Q) * (y @ W_K +
-        b_K), which is fairly messy. To deal with the biases, we concatenate them to W_Q and W_K to
-        simulate a d_model+1 dimensional input (whose final coordinate is always 1), do the SVD
-        factorization on this effective matrix, then separate out into final weights and biases.
-        """
-
-        assert (
-            self.cfg.positional_embedding_type != "rotary"
-        ), "You can't refactor the QK circuit when using rotary embeddings (as the QK matrix depends on the position of the query and key)"
-
-        for l in range(self.cfg.n_layers):
-            # W_QK = W_Q @ W_K.T
-            # Concatenate biases to make a d_model+1 input dimension
-            W_Q_eff = torch.cat(
-                [
-                    state_dict[f"blocks.{l}.attn.W_Q"],
-                    state_dict[f"blocks.{l}.attn.b_Q"][:, None, :],
-                ],
-                dim=1,
-            )
-            W_K_eff = torch.cat(
-                [
-                    state_dict[f"blocks.{l}.attn.W_K"],
-                    state_dict[f"blocks.{l}.attn.b_K"][:, None, :],
-                ],
-                dim=1,
-            )
-
-            W_Q_eff_even, W_K_eff_even_T = (
-                FactoredMatrix(W_Q_eff, W_K_eff.transpose(-1, -2)).make_even().pair
-            )
-            W_K_eff_even = W_K_eff_even_T.transpose(-1, -2)
-
-            state_dict[f"blocks.{l}.attn.W_Q"] = W_Q_eff_even[:, :-1, :]
-            state_dict[f"blocks.{l}.attn.b_Q"] = W_Q_eff_even[:, -1, :]
-            state_dict[f"blocks.{l}.attn.W_K"] = W_K_eff_even[:, :-1, :]
-            state_dict[f"blocks.{l}.attn.b_K"] = W_K_eff_even[:, -1, :]
-
-            # W_OV = W_V @ W_O
-            W_V = state_dict[f"blocks.{l}.attn.W_V"]
-            W_O = state_dict[f"blocks.{l}.attn.W_O"]
-
-            # Factors the bias to be consistent.
-            b_V = state_dict[f"blocks.{l}.attn.b_V"]
-            b_O = state_dict[f"blocks.{l}.attn.b_O"]
-            effective_bias = b_O + einsum(
-                "head_index d_head, head_index d_head d_model -> d_model", b_V, W_O
-            )
-            state_dict[f"blocks.{l}.attn.b_V"] = torch.zeros_like(b_V)
-            state_dict[f"blocks.{l}.attn.b_O"] = effective_bias
-
-            # Helper class to efficiently deal with low rank factored matrices.
-            W_OV = FactoredMatrix(W_V, W_O)
-            U, S, Vh = W_OV.svd()
-            state_dict[f"blocks.{l}.attn.W_V"] = U @ S.diag_embed()
-            state_dict[f"blocks.{l}.attn.W_O"] = utils.transpose(Vh)
-
-        return state_dict
-
-    def set_use_attn_result(self, use_attn_result: bool):
-        """Toggle whether to explicitly calculate and expose the result for each attention head.
-
-        Useful for interpretability but can easily burn through GPU memory.
-        """
-        self.cfg.use_attn_result = use_attn_result
-
-    def set_use_split_qkv_input(self, use_split_qkv_input: bool):
-        """
-        Toggles whether to allow editing of inputs to each attention head.
-        """
-        self.cfg.use_split_qkv_input = use_split_qkv_input
-
-    def set_use_hook_mlp_in(self, use_hook_mlp_in: bool):
-        """Toggles whether to allow storing and editing inputs to each MLP layer."""
-
-        assert not self.cfg.attn_only, "Can't use hook_mlp_in with attn_only model"
-        self.cfg.use_hook_mlp_in = use_hook_mlp_in
-
-    def set_use_attn_in(self, use_attn_in: bool):
-        """
-        Toggles whether to allow editing of inputs to each attention head.
-        """
-        self.cfg.use_attn_in = use_attn_in
-
-    def process_weights_(
-        self,
-        fold_ln: bool = True,
-        center_writing_weights: bool = True,
-        center_unembed: bool = True,
-        refactor_factored_attn_matrices: bool = False,
-    ):
-        """Wrapper around `load_and_process_state_dict`.
-
-        Wrapper around load_and_process_state_dict to allow for in-place processing of the weights.
-        This is useful if using HookedTransformer for training, if we then want to analyse a cleaner
-        version of the same model.
-        """
-        state_dict = self.state_dict()
-        if fold_ln and self.cfg.normalization_type == "LN":
-            # If we're folding the LN into the weights, we need to replace all the layernorm layers
-            # with LayerNormPres, which do not have learnable parameters. This is somewhat hacky,
-            # but it's the easiest way to do it.
-            self.cfg.normalization_type = "LNPre"
-            self.ln_final = LayerNormPre(self.cfg)
-            for layer in self.blocks:
-                layer.ln1 = LayerNormPre(self.cfg)
-                layer.ln2 = LayerNormPre(self.cfg)
-                if self.cfg.act_fn.endswith("_ln"):
-                    layer.mlp.ln = LayerNormPre(self.cfg)
-
-        self.load_and_process_state_dict(
-            state_dict,
-            fold_ln=fold_ln,
-            center_writing_weights=center_writing_weights,
-            center_unembed=center_unembed,
-            refactor_factored_attn_matrices=refactor_factored_attn_matrices,
-        )
-
     @torch.inference_mode()
     def generate(
         self,
@@ -2009,169 +1739,6 @@ class HookedSSM(HookedRootModule):
         circuits.
         """
         return torch.cat([self.W_E, self.W_pos], dim=0)
-
-    # Layer-specific weights are stacked into one massive tensor and given as properties for
-    # convenience and a cache is used to avoid repeated computation. Often a useful convenience when
-    # we want to do analysis on weights across all layers. If GPU memory is a bottleneck, don't use
-    # these properties!
-
-    @property
-    def W_K(self) -> Float[torch.Tensor, "n_layers n_heads d_model d_head"]:
-        """Stack the key weights across all layers."""
-        return torch.stack([block.attn.W_K for block in self.blocks], dim=0)
-
-    @property
-    def W_Q(self) -> Float[torch.Tensor, "n_layers n_heads d_model d_head"]:
-        """Stack the query weights across all layers."""
-        return torch.stack([block.attn.W_Q for block in self.blocks], dim=0)
-
-    @property
-    def W_V(self) -> Float[torch.Tensor, "n_layers n_heads d_model d_head"]:
-        """Stack the value weights across all layers."""
-        return torch.stack([block.attn.W_V for block in self.blocks], dim=0)
-
-    @property
-    def W_O(self) -> Float[torch.Tensor, "n_layers n_heads d_head d_model"]:
-        """Stack the attn output weights across all layers."""
-        return torch.stack([block.attn.W_O for block in self.blocks], dim=0)
-
-    @property
-    def W_in(self) -> Float[torch.Tensor, "n_layers d_model d_mlp"]:
-        """Stack the MLP input weights across all layers."""
-        return torch.stack([block.mlp.W_in for block in self.blocks], dim=0)
-
-    @property
-    def W_gate(self) -> Float[torch.Tensor, "n_layers d_model d_mlp"]:
-        """Stack the MLP gate weights across all layers.
-
-        Only works for models with gated MLPs.
-        """
-        if self.cfg.gated_mlp:
-            return torch.stack([block.mlp.W_gate for block in self.blocks], dim=0)
-        else:
-            return None
-
-    @property
-    def W_out(self) -> Float[torch.Tensor, "n_layers d_mlp d_model"]:
-        """Stack the MLP output weights across all layers."""
-        return torch.stack([block.mlp.W_out for block in self.blocks], dim=0)
-
-    @property
-    def b_K(self) -> Float[torch.Tensor, "n_layers n_heads d_head"]:
-        """Stack the key biases across all layers."""
-        return torch.stack([block.attn.b_K for block in self.blocks], dim=0)
-
-    @property
-    def b_Q(self) -> Float[torch.Tensor, "n_layers n_heads d_head"]:
-        """Stack the query biases across all layers."""
-        return torch.stack([block.attn.b_Q for block in self.blocks], dim=0)
-
-    @property
-    def b_V(self) -> Float[torch.Tensor, "n_layers n_heads d_head"]:
-        """Stack the value biases across all layers."""
-        return torch.stack([block.attn.b_V for block in self.blocks], dim=0)
-
-    @property
-    def b_O(self) -> Float[torch.Tensor, "n_layers d_model"]:
-        """Stack the attn output biases across all layers."""
-        return torch.stack([block.attn.b_O for block in self.blocks], dim=0)
-
-    @property
-    def b_in(self) -> Float[torch.Tensor, "n_layers d_mlp"]:
-        """Stack the MLP input biases across all layers."""
-        return torch.stack([block.mlp.b_in for block in self.blocks], dim=0)
-
-    @property
-    def b_out(self) -> Float[torch.Tensor, "n_layers d_model"]:
-        """Stack the MLP output biases across all layers."""
-        return torch.stack([block.mlp.b_out for block in self.blocks], dim=0)
-
-    @property
-    def QK(self):
-        return FactoredMatrix(self.W_Q, self.W_K.transpose(-2, -1))
-
-    @property
-    def OV(self):
-        return FactoredMatrix(self.W_V, self.W_O)
-
-    # Various utility functions
-    def accumulated_bias(
-        self, layer: int, mlp_input: bool = False, include_mlp_biases=True
-    ) -> Float[torch.Tensor, "layers_accumulated_over d_model"]:
-        """Accumulated Bias.
-
-        Returns the accumulated bias from all layer outputs (ie the b_Os and b_outs), up to the
-        input of layer L.
-
-        Args:
-            layer (int): Layer number, in [0, n_layers]. layer==0 means no layers, layer==n_layers
-                means all layers.
-            mlp_input (bool): If True, we take the bias up to the input of the MLP
-                of layer L (ie we include the bias from the attention output of the current layer,
-                otherwise just biases from previous layers)
-            include_mlp_biases (bool): Whether to include the biases of MLP layers. Often useful to
-                have as False if we're expanding attn_out into individual heads, but keeping mlp_out
-                as is.
-
-        Returns:
-            bias (torch.Tensor): [d_model], accumulated bias
-        """
-        accumulated_bias = torch.zeros(self.cfg.d_model, device=self.cfg.device)
-
-        for i in range(layer):
-            accumulated_bias += self.blocks[i].attn.b_O
-            if include_mlp_biases:
-                accumulated_bias += self.blocks[i].mlp.b_out
-        if mlp_input:
-            assert (
-                layer < self.cfg.n_layers
-            ), "Cannot include attn_bias from beyond the final layer"
-            accumulated_bias += self.blocks[layer].attn.b_O
-        return accumulated_bias
-
-    def all_composition_scores(
-        self, mode
-    ) -> Float[torch.Tensor, "n_layers n_heads n_layers n_heads"]:
-        """All Composition Scores.
-
-        Returns the Composition scores for all pairs of heads, as a L1, H1, L2, H2 tensor (which is
-        upper triangular on the first and third axes).
-
-        See
-        https://transformer-circuits.pub/2021/framework/index.html#:~:text=The%20above%20diagram%20shows%20Q%2D%2C%20K%2D%2C%20and%20V%2DComposition
-        for three metrics used.
-
-        Args:
-            mode (str): One of ["Q", "K", "V"], the mode to use for the composition score.
-        """
-        left = self.OV
-        if mode == "Q":
-            right = self.QK
-        elif mode == "K":
-            right = self.QK.T
-        elif mode == "V":
-            right = self.OV
-        else:
-            raise ValueError(f"mode must be one of ['Q', 'K', 'V'] not {mode}")
-
-        scores = utils.composition_scores(left, right, broadcast_dims=True)
-        # Mask scores to be zero for all pairs with the right head in the same layer or earlier
-        # layer than the left head.
-        mask = (
-            torch.arange(self.cfg.n_layers, device=self.cfg.device)[:, None, None, None]
-            < torch.arange(self.cfg.n_layers, device=self.cfg.device)[
-                None, None, :, None
-            ]
-        )
-        scores = torch.where(mask, scores, torch.zeros_like(scores))
-        return scores
-
-    def all_head_labels(self):
-        return [
-            f"L{l}H{h}"
-            for l in range(self.cfg.n_layers)
-            for h in range(self.cfg.n_heads)
-        ]
 
     def load_sample_training_dataset(self, **kwargs):
         """Load Sample Training Dataset.

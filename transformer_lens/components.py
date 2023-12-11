@@ -8,6 +8,7 @@ import logging
 from typing import Dict, Optional, Tuple, Union
 
 import einops
+import math
 import numpy as np
 import torch
 import torch.nn as nn
@@ -18,6 +19,7 @@ from jaxtyping import Float, Int
 from transformer_lens.FactoredMatrix import FactoredMatrix
 from transformer_lens.hook_points import HookPoint
 from transformer_lens.HookedTransformerConfig import HookedTransformerConfig
+from transformer_lens.HookedSSMConfig import HookedSSMConfig
 from transformer_lens.past_key_value_caching import HookedTransformerKeyValueCacheEntry
 from transformer_lens.utils import gelu_fast, gelu_new, get_offset_position_ids, solu
 
@@ -1310,7 +1312,7 @@ class S6(nn.Module):
     """
     S6 - SSM + Selection Layer taken from https://github.com/state-spaces/mamba/blob/2ee7fd287a8f5c826af6f69ae3aad4682c4afd15/mamba_ssm/modules/mamba_simple.py#L34
     """
-    def __init__(self, cfg: HookedSSMConfig, layer_index: int):
+    def __init__(self, cfg: HookedSSMConfig, layer_index: Optional[int]):
         factory_kwargs = {"device": self.cfg.device, "dtype": self.cfg.dtype}
         super().__init__()
         self.d_model = self.cfg.d_model
@@ -1322,15 +1324,25 @@ class S6(nn.Module):
         self.dt_rank = math.ceil(self.d_model / 16) if self.cfg.dt_rank == "auto" else self.cfg.dt_rank
         self.use_fast_path = self.cfg.use_fast_path
         self.layer_idx = layer_index
+
+        self.hook_xz = HookPoint()
+        self.hook_x = HookPoint()
+        self.hook_delta = HookPoint()
+        self.hook_delta_A = HookPoint()
+        self.hook_delta_B_u = HookPoint()
+        self.hook_b = HookPoint()
+        self.hook_c = HookPoint()
+        self.hook_y = HookPoint()
+        self.hook_out = HookPoint()
         
         self.in_proj = nn.Linear(self.d_model, self.d_inner * 2)
         self.conv1d = nn.Conv1d(
             in_channels=self.d_inner,
             out_channels=self.d_inner,
-            bias=conv_bias,
-            kernel_size=d_conv,
+            bias=self.cfg.conv_bias,
+            kernel_size=self.d_conv,
             groups=self.d_inner,
-            padding=d_conv - 1,
+            padding=self.d_conv - 1,
             **factory_kwargs,
         )
         
@@ -1343,19 +1355,19 @@ class S6(nn.Module):
         self.dt_proj = nn.Linear(self.dt_rank, self.d_inner, bias=True, **factory_kwargs)
         
         # Initialize special dt projection to preserve variance at initialization
-        dt_init_std = self.dt_rank**-0.5 * dt_scale
-        if dt_init == "constant":
+        dt_init_std = self.dt_rank**-0.5 * self.cfg.dt_scale
+        if self.dt_init == "constant":
             nn.init.constant_(self.dt_proj.weight, dt_init_std)
-        elif dt_init == "random":
-            nn.init.uniform_(self.dt_proj.weight, -dt_init_std, dt_init_std)
+        elif self.dt_init == "random":
+            nn.init.uniform_(self.cfg.dt_proj.weight, -dt_init_std, dt_init_std)
         else:
             raise NotImplementedError
 
         # Initialize dt bias so that F.softplus(dt_bias) is between dt_min and dt_max
         dt = torch.exp(
-            torch.rand(self.d_inner, **factory_kwargs) * (math.log(dt_max) - math.log(dt_min))
-            + math.log(dt_min)
-        ).clamp(min=dt_init_floor)
+            torch.rand(self.d_inner, **factory_kwargs) * (math.log(self.cfg.dt_max) - math.log(self.cfg.dt_min))
+            + math.log(self.cfg.dt_min)
+        ).clamp(min=self.dt_init_floor)
         # Inverse of softplus: https://github.com/pytorch/pytorch/issues/72759
         inv_dt = dt + torch.log(-torch.expm1(-dt))
         with torch.no_grad():
@@ -1364,8 +1376,8 @@ class S6(nn.Module):
         self.dt_proj.bias._no_reinit = True
 
         # S4D real initialization
-        A = repeat(
-            torch.arange(1, self.d_state + 1, dtype=torch.float32, device=device),
+        A = einops.repeat(
+            torch.arange(1, self.d_state + 1, dtype=torch.float32, device=self.cfg.device),
             "n -> d n",
             d=self.d_inner,
         ).contiguous()
@@ -1374,10 +1386,10 @@ class S6(nn.Module):
         self.A_log._no_weight_decay = True
 
         # D "skip" parameter
-        self.D = nn.Parameter(torch.ones(self.d_inner, device=device))  # Keep in fp32
+        self.D = nn.Parameter(torch.ones(self.d_inner, device=self.device))  # Keep in fp32
         self.D._no_weight_decay = True
 
-        self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=bias, **factory_kwargs)
+        self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=self.bias, **factory_kwargs)
         
     def forward(self, hidden_states, inference_params=None):
         """_summary_
@@ -1385,9 +1397,6 @@ class S6(nn.Module):
         Args:
             hidden_states (_type_): _description_
             inference_params (_type_, optional): _description_. Defaults to None.
-        """
-            def forward(self, hidden_states, inference_params=None):
-        """
         hidden_states: (B, L, D)
         Returns: same shape as hidden_states
         """
@@ -1402,18 +1411,18 @@ class S6(nn.Module):
                 return out
 
         # We do matmul and transpose BLH -> HBL at the same time
-        xz = rearrange(
-            self.in_proj.weight @ rearrange(hidden_states, "b l d -> d (b l)"),
+        xz = self.hook_xz(einops.rearrange(
+            self.in_proj.weight @ einops.rearrange(hidden_states, "b l d -> d (b l)"),
             "d (b l) -> b d l",
             l=seqlen,
-        )
+        ))
         if self.in_proj.bias is not None:
-            xz = xz + rearrange(self.in_proj.bias.to(dtype=xz.dtype), "d -> d 1")
+            xz = self.hook_xz(xz + einops.rearrange(self.in_proj.bias.to(dtype=xz.dtype), "d -> d 1"))
 
         A = -torch.exp(self.A_log.float())  # (d_inner, d_state)
         # In the backward pass we write dx and dz next to each other to avoid torch.cat
         if self.use_fast_path and inference_params is None:  # Doesn't support outputting the states
-            out = mamba_inner_fn(
+            out = self.hook_out(self.mamba_inner_fn_ref(
                 xz,
                 self.conv1d.weight,
                 self.conv1d.bias,
@@ -1427,48 +1436,147 @@ class S6(nn.Module):
                 self.D.float(),
                 delta_bias=self.dt_proj.bias.float(),
                 delta_softplus=True,
-            )
+            ))
         else:
-            x, z = xz.chunk(2, dim=1)
-            # Compute short convolution
-            if conv_state is not None:
-                conv_state.copy_(x[:, :, -self.d_conv :])  # Update state (B D W)
-            if causal_conv1d_fn is None:
-                x = self.act(self.conv1d(x)[..., :seqlen])
-            else:
-                assert self.activation in ["silu", "swish"]
-                x = causal_conv1d_fn(
-                    x,
-                    rearrange(self.conv1d.weight, "d 1 w -> d w"),
-                    self.conv1d.bias,
-                    self.activation,
-                )
-
-            # We're careful here about the layout, to avoid extra transposes.
-            # We want dt to have d as the slowest moving dimension
-            # and L as the fastest moving dimension, since those are what the ssm_scan kernel expects.
-            x_dbl = self.x_proj(rearrange(x, "b d l -> (b l) d"))  # (bl d)
-            dt, B, C = torch.split(x_dbl, [self.dt_rank, self.d_state, self.d_state], dim=-1)
-            dt = self.dt_proj.weight @ dt.t()
-            dt = rearrange(dt, "d (b l) -> b d l", l=seqlen)
-            B = rearrange(B, "(b l) dstate -> b dstate l", l=seqlen).contiguous()
-            C = rearrange(C, "(b l) dstate -> b dstate l", l=seqlen).contiguous()
-            assert self.activation in ["silu", "swish"]
-            y = selective_scan_fn(
-                x,
-                dt,
-                A,
-                B,
-                C,
-                self.D.float(),
-                z=z,
-                delta_bias=self.dt_proj.bias.float(),
-                delta_softplus=True,
-                return_last_state=ssm_state is not None,
-            )
-            if ssm_state is not None:
-                y, last_state = y
-                ssm_state.copy_(last_state)
-            y = rearrange(y, "b d l -> b l d")
-            out = self.out_proj(y)
+            raise("Currently only supported for fast_path and non-null inference params")
         return out
+
+    def mamba_inner_ref(
+        self,
+        xz, conv1d_weight, conv1d_bias, x_proj_weight, delta_proj_weight,
+        out_proj_weight, out_proj_bias,
+        A, B=None, C=None, D=None, delta_bias=None, B_proj_bias=None,
+        C_proj_bias=None, delta_softplus=True
+    ):
+        L = xz.shape[-1]
+        delta_rank = delta_proj_weight.shape[1]
+        d_state = A.shape[-1] * (1 if not A.is_complex() else 2)
+        x, z = xz.chunk(2, dim=1)
+        x = self.hook_x(causal_conv1d_fn(x, einops.rearrange(conv1d_weight, "d 1 w -> d w"), conv1d_bias, "silu"))
+        # We're being very careful here about the layout, to avoid extra transposes.
+        # We want delta to have d as the slowest moving dimension
+        # and L as the fastest moving dimension, since those are what the ssm_scan kernel expects.
+        x_dbl = F.linear(einops.rearrange(x, 'b d l -> (b l) d'), x_proj_weight)  # (bl d)
+        delta = self.hook_delta(delta_proj_weight @ x_dbl[:, :delta_rank].t())
+        delta = self.hook_delta(einops.rearrange(delta, "d (b l) -> b d l", l=L))
+        if B is None:  # variable B
+            B = self.hook_b(x_dbl[:, delta_rank:delta_rank + d_state])  # (bl d)
+            if B_proj_bias is not None:
+                B = self.hook_b(B + B_proj_bias.to(dtype=B.dtype))
+            if not A.is_complex():
+                B = self.hook_b(einops.rearrange(B, "(b l) dstate -> b dstate l", l=L).contiguous())
+            else:
+                B = self.hook_b(einops.rearrange(B, "(b l) (dstate two) -> b dstate (l two)", l=L, two=2).contiguous())
+        if C is None:  # variable B
+            C = self.hook_c(x_dbl[:, -d_state:])  # (bl d)
+            if C_proj_bias is not None:
+                C = self.hook_c(C + C_proj_bias.to(dtype=C.dtype))
+            if not A.is_complex():
+                C = self.hook_c(einops.rearrange(C, "(b l) dstate -> b dstate l", l=L).contiguous())
+            else:
+                C = self.hook_c(einops.rearrange(C, "(b l) (dstate two) -> b dstate (l two)", l=L, two=2).contiguous())
+        y = self.hook_y(self.selective_scan_fn_ref(x, delta, A, B, C, D, z=z, delta_bias=delta_bias, delta_softplus=True))
+        return F.linear(einops.rearrange(y, "b d l -> b l d"), out_proj_weight, out_proj_bias)
+
+    def selective_scan_ref(self, u, delta, A, B, C, D=None, z=None, delta_bias=None, delta_softplus=False,
+                    return_last_state=False):
+        """
+        u: r(B D L)
+        delta: r(B D L)
+        A: c(D N) or r(D N)
+        B: c(D N) or r(B N L) or r(B N 2L) or r(B G N L) or (B G N L)
+        C: c(D N) or r(B N L) or r(B N 2L) or r(B G N L) or (B G N L)
+        D: r(D)
+        z: r(B D L)
+        delta_bias: r(D), fp32
+
+        out: r(B D L)
+        last_state (optional): r(B D dstate) or c(B D dstate)
+        """
+        dtype_in = u.dtype
+        u = u.float()
+        delta = delta.float()
+        if delta_bias is not None:
+            delta = delta + delta_bias[..., None].float()
+        if delta_softplus:
+            delta = F.softplus(delta)
+        batch, dim, dstate = u.shape[0], A.shape[0], A.shape[1]
+        is_variable_B = B.dim() >= 3
+        is_variable_C = C.dim() >= 3
+        if A.is_complex():
+            if is_variable_B:
+                B = torch.view_as_complex(einops.rearrange(B.float(), "... (L two) -> ... L two", two=2))
+            if is_variable_C:
+                C = torch.view_as_complex(einops.rearrange(C.float(), "... (L two) -> ... L two", two=2))
+        else:
+            B = B.float()
+            C = C.float()
+        x = A.new_zeros((batch, dim, dstate))
+        ys = []
+        deltaA = self.hook_delta_A(torch.exp(torch.einsum('bdl,dn->bdln', delta, A)))
+        if not is_variable_B:
+            deltaB_u = self.hook_delta_B_u(torch.einsum('bdl,dn,bdl->bdln', delta, B, u))
+        else:
+            if B.dim() == 3:
+                deltaB_u = self.hook_delta_B_u(torch.einsum('bdl,bnl,bdl->bdln', delta, B, u))
+            else:
+                B = einops.repeat(B, "B G N L -> B (G H) N L", H=dim // B.shape[1])
+                deltaB_u = self.hook_delta_B_u(torch.einsum('bdl,bdnl,bdl->bdln', delta, B, u))
+        if is_variable_C and C.dim() == 4:
+            C = einops.repeat(C, "B G N L -> B (G H) N L", H=dim // C.shape[1])
+        last_state = None
+        for i in range(u.shape[2]):
+            x = deltaA[:, :, i] * x + deltaB_u[:, :, i]
+            if not is_variable_C:
+                y = torch.einsum('bdn,dn->bd', x, C)
+            else:
+                if C.dim() == 3:
+                    y = torch.einsum('bdn,bn->bd', x, C[:, :, i])
+                else:
+                    y = torch.einsum('bdn,bdn->bd', x, C[:, :, :, i])
+            if i == u.shape[2] - 1:
+                last_state = x
+            if y.is_complex():
+                y = y.real * 2
+            ys.append(y)
+        y = torch.stack(ys, dim=2) # (batch dim L)
+        out = y if D is None else y + u * einops.rearrange(D, "d -> d 1")
+        if z is not None:
+            out = out * F.silu(z)
+        out = out.to(dtype=dtype_in)
+        return out if not return_last_state else (out, last_state)
+
+
+class MambaBlock(nn.Module):
+    """
+    Mamba Block taken from https://github.com/state-spaces/mamba/blob/2ee7fd287a8f5c826af6f69ae3aad4682c4afd15/mamba_ssm/modules/mamba_simple.py#L298
+    """
+    def __init__(self, cfg: HookedSSMConfig, layer_index: int):
+        self.hook_resid = HookPoint()
+        self.hook_hidden_states = HookPoint()
+        self.hook_resid_hidden = HookPoint()
+        self.hook_resid_hidden_norm = HookPoint()
+        self.hook_hidden_mixed = HookPoint()
+        self.residual_in_fp32 = self.cfg.residual_in_fp32
+        self.norm = self.cfg.norm(self.cfg.d_model)
+        self.mixer = S6(cfg.d_model)
+    
+    def forward(self, hidden_states: torch.Tensor, residual: Optional[torch.Tensor], inference_params=None):
+        r"""Pass the input through the encoder layer.
+
+        Args:
+            hidden_states: the sequence to the encoder layer (required).
+            residual: hidden_states = Mixer(LN(residual))
+        """
+        reisdual = self.hook_resid(residual) 
+        hidden_states = self.hook_hidden_states(hidden_states)
+        residual = self.hook_resid_hidden(self.hook_resid((hidden_states + residual) if residual is not None else hidden_states))
+        hidden_states = self.hook_resid_hidden_norm(self.norm(residual.to(dtype=self.norm.weight.dtype)))
+        if self.residual_in_fp32:
+            residual = self.hook_resid_hidden_norm(residual.to(torch.float32))
+        hidden_states = self.hook_hidden_mixed(self.mixer(hidden_states, inference_params=inference_params))
+        return hidden_states, residual
+
+    def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, **kwargs):
+        return self.mixer.allocate_inference_cache(batch_size, max_seqlen, dtype=dtype, **kwargs)
+    

@@ -13,7 +13,6 @@ from typing import Any, Dict, List, Optional
 
 import numpy as np
 import torch
-
 from transformer_lens import utils
 
 SUPPORTED_ACTIVATIONS = ["relu", "gelu", "silu", "gelu_new", "solu_ln", "gelu_fast"]
@@ -52,6 +51,8 @@ class HookedSSMConfig:
     dt_init: str = "random"
     dt_scale: float = 1.0
     dt_init_floor: float = 1e-4
+    residual_in_fp32: bool = False
+    norm: torch.nn.LayerNorm = torch.nn.LayerNorm
     conv_bias: bool = True
     bias: bool = False
     use_fast_path: bool = True
