@@ -1,6 +1,6 @@
-"""Hooked Transformer.
+"""Hooked SSM.
 
-The Hooked Transformer is the core part of TransformerLens.
+The Hooked SSM is the core part of TransformerLens.
 
 In common PyTorch model implementations (e.g. ones from HuggingFace) it's fairly easy to extract
 model weights, but much harder to extract activations. TransformerLens aims to simplify this task by
@@ -160,32 +160,6 @@ class HookedSSM(HookedRootModule):
         # Gives each module a parameter with its name (relative to this root module)
         # Needed for HookPoints to work
         self.setup()
-
-    def check_hooks_to_add(
-        self,
-        hook_point,
-        hook_point_name,
-        hook,
-        dir="fwd",
-        is_permanent=False,
-        prepend=False,
-    ) -> None:
-        if hook_point_name.endswith("attn.hook_result"):
-            assert (
-                self.cfg.use_attn_result
-            ), f"Cannot add hook {hook_point_name} if use_attn_result_hook is False"
-        if hook_point_name.endswith(("hook_q_input", "hook_k_input", "hook_v_input")):
-            assert (
-                self.cfg.use_split_qkv_input
-            ), f"Cannot add hook {hook_point_name} if use_split_qkv_input is False"
-        if hook_point_name.endswith("mlp_in"):
-            assert (
-                self.cfg.use_hook_mlp_in
-            ), f"Cannot add hook {hook_point_name} if use_hook_mlp_in is False"
-        if hook_point_name.endswith("attn_in"):
-            assert (
-                self.cfg.use_attn_in
-            ), f"Cannot add hook {hook_point_name} if use_attn_in is False"
 
     def input_to_embed(
         self,
@@ -951,7 +925,7 @@ class HookedSSM(HookedRootModule):
         default_padding_side: Optional[Literal["left", "right"]] = "right",
         dtype="float32",
         **from_pretrained_kwargs,
-    ) -> "HookedTransformer":
+    ) -> "HookedSSM":
         """Load in a Pretrained Model.
 
         Load in pretrained model weights to the HookedTransformer format and optionally to do some

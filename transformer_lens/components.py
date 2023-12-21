@@ -13,6 +13,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from causal_conv1d import causal_conv1d_fn
 from fancy_einsum import einsum
 from jaxtyping import Float, Int
 
@@ -1438,7 +1439,48 @@ class S6(nn.Module):
                 delta_softplus=True,
             ))
         else:
-            raise("Currently only supported for fast_path and non-null inference params")
+            x, z = xz.chunk(2, dim=1)
+            # Compute short convolution
+            if conv_state is not None:
+                conv_state.copy_(x[:, :, -self.d_conv :])  # Update state (B D W)
+            if causal_conv1d_fn is None:
+                x = self.act(self.conv1d(x)[..., :seqlen])
+            else:
+                assert self.activation in ["silu", "swish"]
+                x = causal_conv1d_fn(
+                    x,
+                    einops.rearrange(self.conv1d.weight, "d 1 w -> d w"),
+                    self.conv1d.bias,
+                    self.activation,
+                )
+
+            # We're careful here about the layout, to avoid extra transposes.
+            # We want dt to have d as the slowest moving dimension
+            # and L as the fastest moving dimension, since those are what the ssm_scan kernel expects.
+            x_dbl = self.x_proj(einops.rearrange(x, "b d l -> (b l) d"))  # (bl d)
+            dt, B, C = torch.split(x_dbl, [self.dt_rank, self.d_state, self.d_state], dim=-1)
+            dt = self.dt_proj.weight @ dt.t()
+            dt = self.hook_delta(einops.rearrange(dt, "d (b l) -> b d l", l=seqlen))
+            B = self.hook_b(einops.rearrange(B, "(b l) dstate -> b dstate l", l=seqlen).contiguous())
+            C = self.hook_b(einops.rearrange(C, "(b l) dstate -> b dstate l", l=seqlen).contiguous())
+            assert self.activation in ["silu", "swish"]
+            y = self.selective_scan_fn_ref(
+                x,
+                dt,
+                A,
+                B,
+                C,
+                self.D.float(),
+                z=z,
+                delta_bias=self.dt_proj.bias.float(),
+                delta_softplus=True,
+                return_last_state=ssm_state is not None,
+            )
+            if ssm_state is not None:
+                y, last_state = y
+                ssm_state.copy_(last_state)
+            y = self.hook_y(einops.rearrange(y, "b d l -> b l d"))
+            out = self.hook_out(self.out_proj(y))
         return out
 
     def mamba_inner_ref(
@@ -1568,7 +1610,7 @@ class MambaBlock(nn.Module):
             hidden_states: the sequence to the encoder layer (required).
             residual: hidden_states = Mixer(LN(residual))
         """
-        reisdual = self.hook_resid(residual) 
+        residual = self.hook_resid(residual) 
         hidden_states = self.hook_hidden_states(hidden_states)
         residual = self.hook_resid_hidden(self.hook_resid((hidden_states + residual) if residual is not None else hidden_states))
         hidden_states = self.hook_resid_hidden_norm(self.norm(residual.to(dtype=self.norm.weight.dtype)))
